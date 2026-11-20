@@ -13,6 +13,7 @@ mod web_server;
 pub use c_api::*;
 pub use connection::align_foveation_center_shift;
 pub use logging_backend::init_logging;
+pub use statistics::FramePacing;
 pub use tracking::HandType;
 
 use crate::connection::VideoPacket;
@@ -528,6 +529,20 @@ impl ServerCoreContext {
                     .bitrate
                     .adapt_to_framerate,
             );
+    }
+
+    pub fn frame_pacing(&self) -> Option<FramePacing> {
+        let enabled = SESSION_MANAGER
+            .read()
+            .settings()
+            .video
+            .enforce_server_frame_pacing;
+
+        self.connection_context
+            .statistics_manager
+            .write()
+            .as_mut()
+            .map(|stats| stats.frame_pacing(Instant::now(), enabled))
     }
 
     pub fn duration_until_next_vsync(&self) -> Option<Duration> {

@@ -243,7 +243,7 @@ void OvrDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture) {
                 pSyncTexture->QueryInterface(__uuidof(IDXGIKeyedMutex), (void**)&pKeyedMutex)
             )) {
             // TODO: Reasonable timeout and timeout handling
-            HRESULT hr = pKeyedMutex->AcquireSync(0, 10);
+            HRESULT hr = pKeyedMutex->AcquireSync(0, 500);
             if (hr != S_OK) {
                 Debug(
                     "[VDispDvr] ACQUIRESYNC FAILED!!! hr=%d %p %ls", hr, hr, GetErrorStr(hr).c_str()
@@ -276,7 +276,7 @@ void OvrDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture) {
 void OvrDirectModeComponent::PostPresent(const vr::IVRDriverDirectModeComponent::Throttling_t*) {
     Debug("OvrDirectModeComponent::PostPresent");
 
-    WaitForVSync();
+    WaitForFramePacing();
 }
 
 void OvrDirectModeComponent::CopyTexture(uint32_t layerCount) {

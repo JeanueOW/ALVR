@@ -40,6 +40,12 @@ struct BatteryData {
     is_plugged: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum FramePacing {
+    Disabled,
+    WaitUntil(Instant),
+}
+
 pub struct StatisticsManager {
     history_buffer: VecDeque<HistoryFrame>,
     max_history_size: usize,
@@ -55,6 +61,7 @@ pub struct StatisticsManager {
     motion_to_photon_latency_average: SlidingWindowAverage<Duration>,
     last_vsync_time: Instant,
     frame_interval: Duration,
+    next_frame_deadline: Option<Instant>,
     last_throughput_directives: BitrateDirectives,
 }
 
@@ -85,6 +92,7 @@ impl StatisticsManager {
             ),
             last_vsync_time: Instant::now(),
             frame_interval: nominal_server_frame_interval,
+            next_frame_deadline: None,
             last_throughput_directives: BitrateDirectives::default(),
         }
     }
@@ -296,6 +304,19 @@ impl StatisticsManager {
         self.steamvr_pipeline_latency
     }
 
+    pub fn frame_pacing(&mut self, now: Instant, enabled: bool) -> FramePacing {
+        if !enabled {
+            self.next_frame_deadline = None;
+            return FramePacing::Disabled;
+        }
+
+        // A late frame starts a new cadence so it can proceed as soon as it is ready.
+        let deadline = self.next_frame_deadline.unwrap_or(now).max(now);
+        self.next_frame_deadline = Some(deadline + self.frame_interval);
+
+        FramePacing::WaitUntil(deadline)
+    }
+
     // NB: this call is non-blocking, waiting should be done externally
     pub fn duration_until_next_vsync(&mut self) -> Duration {
         let now = Instant::now();
@@ -306,5 +327,67 @@ impl StatisticsManager {
         }
 
         (self.last_vsync_time + self.frame_interval).saturating_duration_since(now)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_pacing_preserves_rates_below_refresh_rate() {
+        let refresh_interval = Duration::from_secs_f64(1.0 / 120.0);
+        for fps in [119, 100, 85, 57, 34, 24] {
+            let mut stats = StatisticsManager::new(1, refresh_interval, 0.0);
+            let interval = Duration::from_secs_f64(1.0 / f64::from(fps));
+            let mut ready = Instant::now();
+
+            for _ in 0..fps {
+                assert_eq!(
+                    stats.frame_pacing(ready, true),
+                    FramePacing::WaitUntil(ready),
+                    "unexpected wait at {fps} FPS"
+                );
+                ready += interval;
+            }
+        }
+    }
+
+    #[test]
+    fn frame_pacing_caps_fast_frames_and_recovers_after_a_stall() {
+        let interval = Duration::from_secs_f64(1.0 / 120.0);
+        let mut stats = StatisticsManager::new(1, interval, 0.0);
+        let start = Instant::now();
+
+        assert_eq!(
+            stats.frame_pacing(start, true),
+            FramePacing::WaitUntil(start)
+        );
+        for frame in 1..=3 {
+            let deadline = start + interval * frame;
+            assert_eq!(
+                stats.frame_pacing(deadline - interval / 2, true),
+                FramePacing::WaitUntil(deadline)
+            );
+        }
+
+        let late = start + interval * 10 + interval / 2;
+        assert_eq!(stats.frame_pacing(late, true), FramePacing::WaitUntil(late));
+        assert_eq!(
+            stats.frame_pacing(late + interval / 2, true),
+            FramePacing::WaitUntil(late + interval)
+        );
+    }
+
+    #[test]
+    fn disabling_frame_pacing_clears_the_deadline() {
+        let interval = Duration::from_secs_f64(1.0 / 120.0);
+        let mut stats = StatisticsManager::new(1, interval, 0.0);
+        let start = Instant::now();
+        stats.frame_pacing(start, true);
+
+        let now = start + interval / 2;
+        assert_eq!(stats.frame_pacing(now, false), FramePacing::Disabled);
+        assert_eq!(stats.frame_pacing(now, true), FramePacing::WaitUntil(now));
     }
 }

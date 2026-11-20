@@ -25,7 +25,7 @@ use alvr_common::{
 use alvr_filesystem as afs;
 use alvr_packets::{ButtonValue, Haptics};
 use alvr_server_core::{
-    HandType, ServerCoreContext, ServerCoreEvent, ServerNegotiatedStreamingConfig,
+    FramePacing, HandType, ServerCoreContext, ServerCoreEvent, ServerNegotiatedStreamingConfig,
 };
 use alvr_session::{
     BodyTrackingSinkConfig, CodecType, ControllersConfig, ControllersEmulationMode,
@@ -706,32 +706,29 @@ extern "C" fn report_present(timestamp_ns: u64, offset_ns: u64) {
     }
 }
 
-#[unsafe(export_name = "WaitForVSync")]
-extern "C" fn wait_for_vsync() {
+#[unsafe(export_name = "WaitForFramePacing")]
+extern "C" fn wait_for_frame_pacing() {
     // Default 120Hz-ish wait if StatisticsManager isn't up.
     // We use 120Hz-ish so that SteamVR doesn't accidentally get
     // any weird ideas about our display Hz with its frame pacing.
     static PRE_HEADSET_STATS_WAIT_INTERVAL: Duration = Duration::from_millis(8);
 
     // NB: don't sleep while locking SERVER_DATA_MANAGER or SERVER_CORE_CONTEXT
-    let sleep_duration = SERVER_CORE_CONTEXT
+    let pacing = SERVER_CORE_CONTEXT
         .read()
         .as_ref()
-        .and_then(|ctx| ctx.duration_until_next_vsync());
+        .and_then(ServerCoreContext::frame_pacing);
 
-    if let Some(duration) = sleep_duration {
-        if alvr_server_core::settings()
-            .video
-            .enforce_server_frame_pacing
-        {
-            thread::sleep(duration);
-        } else {
-            thread::yield_now();
+    match pacing {
+        Some(FramePacing::WaitUntil(deadline)) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                thread::sleep(remaining);
+            }
         }
-    } else {
-        // StatsManager isn't up because the headset hasn't connected,
-        // safety fallback to prevent deadlocking.
-        thread::sleep(PRE_HEADSET_STATS_WAIT_INTERVAL);
+        Some(FramePacing::Disabled) => thread::yield_now(),
+        // Fall back to sleeping until statistics are available to avoid a busy loop.
+        None => thread::sleep(PRE_HEADSET_STATS_WAIT_INTERVAL),
     }
 }
 

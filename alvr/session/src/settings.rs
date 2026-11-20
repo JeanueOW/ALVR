@@ -719,7 +719,7 @@ For eye-tracked foveation, enable Headset > Face tracking > Sink > Eye-tracked f
 
     #[cfg_attr(not(target_os = "windows"), schema(flag = "hidden"))]
     #[schema(strings(
-        help = r"This works only on Windows. It shouldn't be disabled except in certain circumstances when you know the VR game will not meet the target framerate."
+        help = "Windows only. Paces server frames up to the headset refresh rate. If a frame misses its deadline, the server continues immediately."
     ))]
     #[schema(flag = "real-time")]
     pub enforce_server_frame_pacing: bool,
