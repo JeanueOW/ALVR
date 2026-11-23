@@ -1,11 +1,10 @@
 use super::{
     MultiplexedSocketReader, MultiplexedSocketWriter, ReconstructedPacket,
-    SHARD_COMMON_PREFIX_SIZE, ShardPrefix, StreamRecvQueues,
+    SHARD_COMMON_PREFIX_SIZE, ShardPrefix, SocketConnectionConfig, StreamRecvQueues,
 };
 use crate::LOCAL_IP;
 use alvr_common::{ConResult, HandleTryAgain, ToCon, anyhow::Result};
-use alvr_session::{DscpTos, SocketBufferConfig};
-use socket2::{MaybeUninitSlice, Socket};
+use socket2::{MaybeUninitSlice, SockRef, Socket};
 use std::ffi::c_int;
 use std::{
     cmp::Ordering,
@@ -13,12 +12,18 @@ use std::{
     mem::MaybeUninit,
     net::{IpAddr, UdpSocket},
     ptr,
-    time::Duration,
+    sync::Arc,
+    time::{Duration, Instant},
 };
+
+const PROBE_PACKET: &[u8] = b"ALVR_PRB";
+const PROBE_ACK_PACKET: &[u8] = b"ALVR_ACK";
+const PROBE_SEND_INTERVAL: Duration = Duration::from_millis(50);
+const PROBE_ANSWER_INTERVAL: Duration = Duration::from_millis(250);
 
 pub const SHARD_PREFIX_SIZE: usize = SHARD_COMMON_PREFIX_SIZE;
 
-fn socket_peek(socket: &mut Socket, buffer: &mut [u8]) -> ConResult<usize> {
+fn socket_peek(socket: &Socket, buffer: &mut [u8]) -> ConResult<usize> {
     #[cfg(windows)]
     const FLAGS: c_int = 0x02 | 0x8000; // MSG_PEEK | MSG_PARTIAL
     #[cfg(not(windows))]
@@ -33,30 +38,61 @@ fn socket_peek(socket: &mut Socket, buffer: &mut [u8]) -> ConResult<usize> {
         .0)
 }
 
-// Create tokio socket, convert to socket2, apply settings, convert back to tokio. This is done to
-// let tokio set all the internal parameters it needs from the start.
-pub fn bind(
-    port: u16,
-    dscp: Option<DscpTos>,
-    buffer_config: SocketBufferConfig,
-) -> Result<UdpSocket> {
-    let socket = UdpSocket::bind((LOCAL_IP, port))?.into();
+pub fn bind(local_port: u16, peer_ip: IpAddr, peer_port: u16) -> Result<UdpSocket> {
+    let socket = UdpSocket::bind((LOCAL_IP, local_port))?;
+    socket.connect((peer_ip, peer_port))?;
 
-    crate::set_socket_buffers(&socket, buffer_config).ok();
-    crate::set_dscp(&socket, dscp);
-
-    Ok(socket.into())
+    Ok(socket)
 }
 
-pub fn connect(socket: &UdpSocket, peer_ip: IpAddr, port: u16, timeout: Duration) -> Result<()> {
-    socket.connect((peer_ip, port))?;
-    socket.set_read_timeout(Some(timeout))?;
+pub fn probe_peer(socket: &UdpSocket, timeout: Duration) -> Result<bool> {
+    socket.set_read_timeout(Some(PROBE_SEND_INTERVAL))?;
+
+    let deadline = Instant::now() + timeout;
+    let mut next_probe_instant = Instant::now();
+    let mut buffer = [0; SHARD_PREFIX_SIZE];
+    while Instant::now() < deadline {
+        if Instant::now() >= next_probe_instant {
+            socket.send(PROBE_PACKET).ok();
+            next_probe_instant = Instant::now() + PROBE_SEND_INTERVAL;
+        }
+
+        if let Ok(size) = socket.recv(&mut buffer)
+            && &buffer[..size] == PROBE_ACK_PACKET
+        {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+pub fn answer_probes(socket: &UdpSocket, timeout: Duration) -> Result<()> {
+    socket.set_read_timeout(Some(PROBE_SEND_INTERVAL))?;
+
+    let peek_socket = SockRef::from(socket);
+    let mut deadline = Instant::now() + timeout;
+    let mut buffer = [0; SHARD_PREFIX_SIZE];
+    while Instant::now() < deadline {
+        let Ok(size) = socket_peek(&peek_socket, &mut buffer) else {
+            continue;
+        };
+
+        if buffer.get(..size) != Some(PROBE_PACKET) {
+            break;
+        }
+
+        socket.recv(&mut buffer).ok();
+        socket.send(PROBE_ACK_PACKET).ok();
+
+        deadline = deadline.min(Instant::now() + PROBE_ANSWER_INTERVAL);
+    }
 
     Ok(())
 }
 
 pub struct MultiplexedUdpWriter {
-    inner: UdpSocket,
+    inner: Arc<Socket>,
     max_packet_size: usize,
 }
 
@@ -94,7 +130,7 @@ struct InProgressPacket {
 }
 
 pub struct MultiplexedUdpReader {
-    inner: Socket,
+    inner: Arc<Socket>,
     max_packet_size: usize,
     in_progress_packets: HashMap<u16, HashMap<u32, InProgressPacket>>,
 }
@@ -114,7 +150,7 @@ impl MultiplexedSocketReader for MultiplexedUdpReader {
         };
 
         let mut prefix_bytes = [0; SHARD_PREFIX_SIZE];
-        let peek_size = socket_peek(&mut self.inner, &mut prefix_bytes)?;
+        let peek_size = socket_peek(&self.inner, &mut prefix_bytes)?;
         if peek_size < SHARD_PREFIX_SIZE {
             return discard_and_try_again(&self.inner);
         }
@@ -237,21 +273,21 @@ impl MultiplexedSocketReader for MultiplexedUdpReader {
 
 pub fn split_multiplexed(
     socket: UdpSocket,
-    max_packet_size: usize,
-) -> Result<(
-    Box<dyn MultiplexedSocketWriter + Send + Sync>,
-    Box<dyn MultiplexedSocketReader + Send>,
-)> {
+    config: &SocketConnectionConfig,
+) -> Result<(MultiplexedUdpWriter, MultiplexedUdpReader)> {
+    let socket = Arc::new(Socket::from(socket));
+    crate::configure_socket(&socket, config)?;
+
     let writer = MultiplexedUdpWriter {
-        inner: socket.try_clone()?,
-        max_packet_size,
+        inner: Arc::clone(&socket),
+        max_packet_size: config.max_packet_size,
     };
 
     let reader = MultiplexedUdpReader {
-        inner: socket.into(),
-        max_packet_size,
+        inner: socket,
+        max_packet_size: config.max_packet_size,
         in_progress_packets: HashMap::new(),
     };
 
-    Ok((Box::new(writer), Box::new(reader)))
+    Ok((writer, reader))
 }
